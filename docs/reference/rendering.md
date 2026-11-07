@@ -916,6 +916,13 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
 - **Fix:** `rp_prepare` makes the attachment view in `view_format` (the images of uncompressed colour formats are mutable).
 - **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md).
 
+### Compressed render targets through an uncompressed shadow on Vulkan
+
+- **Symptom:** Android only: `[RED] [vk] texture view in format 95 over an image of format 139: read in the image's` (an RGBA16UI view of a BC4 image), and in the kernel log (`adb shell dmesg`) `CP opcode error interrupt | opcode=0x00000000` with `kgsl … ctx_type VK` lines, one per submission that holds the pass; whatever else those submissions recorded (uploads, other passes) never reaches the GPU.
+- **Cause:** a GPU block encoder draws into a BC texture through an uncompressed integer view, one texel per block. Vulkan has no such attachment, so `rp_prepare` attached the BC image itself; the Adreno 740's command processor stopped on that pass and the kernel driver dropped the whole submission.
+- **Fix:** as on Metal ([Compressed textures as render targets through an uncompressed shadow](#compressed-textures-as-render-targets-through-an-uncompressed-shadow)): `rp_prepare` attaches a shadow image of blocks × blocks in the view's format (`bcrt_shadow`, made once per base image, level, layer and format), copies the level's (layer's, or 3D depth plane's) blocks into it first, and `rp_end` copies them back (`bcrt_copy`: `vkCmdCopyImage` between a format and a compressed one of the same block size). The shadows go with their base image (`bcrt_drop` from `views_drop`).
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md): agl's BC4 block encoder writes a 32×32×32 BC4 3D texture one depth plane per pass through an RGBA16UI view; three faulting submissions at every start on an Ayn Odin 2 (Adreno 740, driver 0676.32), none after the fix. One of them held the sky's scattering-table upload, so the sky stayed murky olive.
+
 ### Replay syncs limited to what is read
 
 - **Symptom:** low frame rate with the GPU and the CPU both mostly idle; the render thread waiting in `view_` / `submit_wait`.

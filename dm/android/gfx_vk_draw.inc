@@ -557,7 +557,9 @@ make:
 }
 // the views (and framebuffers) of an image that goes: destroyed with it
 static nvn_hmap g_fbs;
+static void bcrt_drop(VkImage base);   // below, with the render passes
 static void views_drop(VkImage img) {
+    bcrt_drop(img);
     for (uint32_t i = 0; i < g_views.cap; i++) {
         if (!g_views.vals[i]) continue;
         view_key *k = (view_key *)(void *)(g_views.keys + (size_t)i * g_views.klen);
@@ -747,12 +749,66 @@ static void prof_write(void) {
                  r->ncolor, r->f0, r->depth, r->draws, (unsigned long long)r->verts, (unsigned long long)r->big, r->bigvs ? r->bigvs : "-", r->bigfs ? r->bigfs : "-"); }
     g_nprof = 0; g_prof_at = -1;
 }
-static void rp_end(void) { if (P.active) { occl_end(); prof_pass_end(); vkCmdEndRenderPass(C->cb); P.active = 0; if (dump_on()) dump_pass_end(); } }
+// Compressed render targets through an uncompressed shadow (nvn_mtl.m bcrt_attach / bcrt_flush). A GPU block encoder draws into a BC texture through an uncompressed
+// integer view, one texel per block: agl's BC4 encoder in Breath of the Wild (8e2cc2671cae6020, a 32×32 BC4 texture through an RGBA16UI view) and Tears of the Kingdom
+// (one depth plane of a 32×32×32 BC4 texture per pass). Vulkan has no such attachment: the BC image itself was attached, and every submission holding that pass stopped the
+// Adreno 740's command processor ("CP opcode error", three at every Breath of the Wild start, in the kernel log), and the kernel driver dropped each such submission whole,
+// with everything else recorded in it (uploads, other passes). The pass draws into a shadow of blocks × blocks in the view's
+// format instead; the level's (layer's or depth plane's) blocks are copied into it before the pass and back after it (vkCmdCopyImage: a block and a texel of one size)
+typedef struct { VkImage base; uint32_t lv, ly; VkFormat f; } bcrt_key;
+static nvn_hmap g_bcrt = {.klen = sizeof(bcrt_key)};
+static struct { vtex *base, *sh; uint32_t lv, ly; } g_bcrt_pend[8];   // the pass's shadowed attachments: copied back at rp_end
+static uint64_t g_bcrt_n;
+static int bc_block_bytes(VkFormat f) {   // a BC format's block size; 0: not BC
+    if (f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC1_RGBA_SRGB_BLOCK) return 8;
+    if (f == VK_FORMAT_BC4_UNORM_BLOCK || f == VK_FORMAT_BC4_SNORM_BLOCK) return 8;
+    if (f >= VK_FORMAT_BC2_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK) return 16;
+    return 0;
+}
+static VkImageSubresourceLayers bcrt_sub(const vtex *b, uint32_t lv, uint32_t ly) { return (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, lv, b->type == VK_IMAGE_TYPE_3D ? 0 : ly, 1}; }
+static VkOffset3D bcrt_off(const vtex *b, uint32_t ly) { return (VkOffset3D){0, 0, b->type == VK_IMAGE_TYPE_3D ? (int32_t)ly : 0}; }
+// the shadow of base's level lv, layer (or depth plane) ly, for an attachment view of NVN format nf: NULL when base is not BC or the view is not one block per texel
+static vtex *bcrt_shadow(vtex *b, uint32_t nf, uint32_t lv, uint32_t ly) {
+    int bb = bc_block_bytes(b->fmt); uint32_t m = 0; uint8_t sw[4];
+    if (!bb || b->conv || !nvn_fmt_to_mtl(nf, &m, sw) || !m) return NULL;
+    VkFormat f = vk_of_mtl(m); if (!f || fmt_bytes(f) != bb) return NULL;
+    bcrt_key k; memset(&k, 0, sizeof k); k.base = b->img; k.lv = lv; k.ly = ly; k.f = f;
+    vtex *s = nvn_hm_get(&g_bcrt, &k); if (s) return s;
+    uint32_t lw = b->w >> lv ? b->w >> lv : 1, lh = b->h >> lv ? b->h >> lv : 1;
+    tex_t t; memset(&t, 0, sizeof t); t.magic = MAGIC('T', 'E', 'X', 0); t.serial = ~0x10000ull - g_bcrt_n++; t.d.target = NVN_TEXTURE_TARGET_2D; t.d.format = nf;
+    t.d.width = (lw + 3) / 4; t.d.height = (lh + 3) / 4; t.d.depth = 1; t.d.levels = 1;
+    if (!(s = vt_create(&t))) return NULL;
+    nvn_hm_put(&g_bcrt, &k, s);
+    static int nlog; if (nlog++ < 4) LOG("[vk] compressed render target s%llu (vk%d %ux%u level %u layer %u) drawn through a %ux%u shadow in vk%d", (unsigned long long)b->serial, b->fmt, b->w, b->h, lv, ly, t.d.width, t.d.height, f);
+    return s;
+}
+static void bcrt_drop(VkImage base) {   // base goes: its shadows too
+    for (uint32_t i = 0; i < g_bcrt.cap; i++) {
+        vtex *s = g_bcrt.vals[i]; if (!s) continue;
+        bcrt_key k; memcpy(&k, g_bcrt.keys + (size_t)i * g_bcrt.klen, sizeof k); if (k.base != base) continue;
+        nvn_hm_del(&g_bcrt, &k); vt_destroy(s); i = (uint32_t)-1;   // the table moved entries on delete: scan again
+    }
+}
+static void bcrt_copy(vtex *b, vtex *s, uint32_t lv, uint32_t ly, int back) {   // outside a pass: the blocks into the shadow (back 0) or out of it
+    VkImageCopy r; memset(&r, 0, sizeof r);
+    VkImageSubresourceLayers bs = bcrt_sub(b, lv, ly), ss = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    if (back) { r.srcSubresource = ss; r.dstSubresource = bs; r.dstOffset = bcrt_off(b, ly); r.extent = (VkExtent3D){s->w, s->h, 1}; }   // the extent is the source's: texels of the shadow
+    else { uint32_t lw = b->w >> lv ? b->w >> lv : 1, lh = b->h >> lv ? b->h >> lv : 1;
+           r.srcSubresource = bs; r.srcOffset = bcrt_off(b, ly); r.dstSubresource = ss; r.extent = (VkExtent3D){lw, lh, 1}; }   // texels of the BC level
+    cb_barrier();
+    vkCmdCopyImage(C->cb, back ? s->img : b->img, VK_IMAGE_LAYOUT_GENERAL, back ? b->img : s->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    cb_barrier();
+}
+static void rp_end(void) {
+    if (!P.active) return;
+    occl_end(); prof_pass_end(); vkCmdEndRenderPass(C->cb); P.active = 0; if (dump_on()) dump_pass_end();
+    for (int i = 0; i < 8; i++) if (g_bcrt_pend[i].sh) { bcrt_copy(g_bcrt_pend[i].base, g_bcrt_pend[i].sh, g_bcrt_pend[i].lv, g_bcrt_pend[i].ly, 1); g_bcrt_pend[i].sh = NULL; }
+}
 // the render pass of the bound render targets (R.rt): images, views and framebuffer, made before the draw's textures are resolved (that may record uploads, outside a pass)
 static int rp_prepare(void) {
     if (P.active) return 1;
     if (!R.has_rt) { RED_ONCE(83, "draw with no render target set"); return 0; }
-    memset(P.cv, 0, sizeof P.cv);
+    memset(P.cv, 0, sizeof P.cv); memset(g_bcrt_pend, 0, sizeof g_bcrt_pend);
     rp_key k; memset(&k, 0, sizeof k); VkImageView views[9]; memset(views, 0, sizeof views); uint32_t nv = 0, w = UINT32_MAX, h = UINT32_MAX, layers = 1; k.samples = 1;
     k.ncolor = (uint32_t)(R.rt.n > 8 ? 8 : R.rt.n);
     for (uint32_t i = 0; i < k.ncolor; i++) {
@@ -760,6 +816,16 @@ static int rp_prepare(void) {
         vtex *v = vt_get(R.rt.color[i]); if (!v) continue;
         const view_t *cv = R.rt.has_cview[i] ? &R.rt.cview[i] : NULL;
         uint32_t lv = cv && cv->set_levels ? cv->base_level : 0, ly = cv && cv->set_layers ? cv->min_layer : 0;
+        vtex *sh = cv && cv->set_format ? bcrt_shadow(v, cv->format, lv, ly) : NULL;   // a BC texture written through a one-block-per-texel view (bcrt_shadow)
+        if (sh) {
+            VkCommandBuffer c = cb(); if (!c) continue;
+            bcrt_copy(v, sh, lv, ly, 0);
+            VkImageView iv = view_get(sh, VK_IMAGE_VIEW_TYPE_2D, 0, 1, 0, 1, VK_IMAGE_ASPECT_COLOR_BIT, NULL); if (!iv) continue;
+            k.color[i] = sh->fmt; k.samples = sh->samples; views[nv++] = iv; P.cv[i] = sh; P.clv[i] = 0; P.cly[i] = 0;
+            g_bcrt_pend[i].base = v; g_bcrt_pend[i].sh = sh; g_bcrt_pend[i].lv = lv; g_bcrt_pend[i].ly = ly;
+            if (sh->w < w) w = sh->w; if (sh->h < h) h = sh->h;
+            continue;
+        }
         // in the format of the target's view: Super Mario Bros. Wonder's last pass writes its RGBA8 window texture through an RGBA8_SRGB view, and in the image's
         // format the linear values were stored unencoded (the whole picture darker and more saturated; nvn_mtl.m found the same)
         g_view_fmt = cv ? view_format(v, cv) : VK_FORMAT_UNDEFINED; VkFormat af = g_view_fmt ? g_view_fmt : v->fmt;
