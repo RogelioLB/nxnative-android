@@ -61,7 +61,8 @@ qos_class_t dm_android_qos_get(void) { return t_qos ? t_qos : QOS_CLASS_DEFAULT;
 
 // The usable stack, as Darwin's pthread_get_stackaddr_np / pthread_get_stacksize_np give it. Bionic's range for a pthread_create thread starts at its mapping, guard page(s) included:
 // QueryMemory reported that unreadable page as the start of the main thread's stack, and Unity's conservative GC, which scans the whole stack it was told of, faulted on it
-// at the first collection (Danganronpa V3, main+0x2194c4 under GC mark, an address 8 MB below sp)
+// at the first collection (Danganronpa V3, main+0x2194c4 under GC mark, an address 8 MB below sp).
+// The range must stay readable for the thread's life: a guest thread must never attach to the Java VM, since ART then protects the page above the guard (front_text_input)
 size_t dm_android_stack_info(void **top) {
     pthread_attr_t a; void *lo = NULL; size_t n = 0, guard = 0;
     if (!pthread_getattr_np(pthread_self(), &a)) { pthread_attr_getstack(&a, &lo, &n); pthread_attr_getguardsize(&a, &guard); pthread_attr_destroy(&a); }

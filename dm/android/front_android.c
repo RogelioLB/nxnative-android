@@ -221,20 +221,32 @@ int front_screen_max_fps(void) { return 0; }
 void front_screen_match(int fps) { (void)fps; }
 void front_progress(const char *title, long done, long total) { if (title) LOG("progress: %s %ld / %ld", title, done, total); }
 static jclass g_gp;   // org.nxnative.android.Gamepad (java/), from the activity's class loader
-// The software keyboard (hle_swkbd.c): Gamepad.ask shows an input box on the UI thread and this (a guest) thread waits for it
+// The software keyboard (hle_swkbd.c): Gamepad.ask shows an input box on the UI thread and the guest thread that asked waits for it.
+// The Java call runs on a host thread of its own, never on the guest's thread: attaching a thread to the VM makes ART protect the page above bionic's guard page at the
+// bottom of its stack (its implicit stack-overflow check), and it stays protected after the detach. The guest's main thread runs on its host thread's stack, which
+// QueryMemory reported to the SDK at start as that thread's stack (dm_android_stack_info), so Unity's conservative GC, which scans the whole range, faulted on the page
+// at its next collection (Brilliant Diamond 17 s after name entry: main+0x2944c0 under GC mark, the first page of the main thread's stack). No guest thread may attach.
+typedef struct { const char *title, *sub, *guide, *initial; int max_chars, out_cap, ok; char *out; } text_req;
+static void *text_input_thread(void *p) {
+    text_req *q = p; JavaVM *vm = g_app->activity->vm; JNIEnv *e;
+    if ((*vm)->AttachCurrentThread(vm, &e, NULL)) return NULL;
+    jmethodID m = (*e)->GetStaticMethodID(e, g_gp, "ask", "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)Ljava/lang/String;");
+    jstring jt = (*e)->NewStringUTF(e, q->title ? q->title : ""), js = (*e)->NewStringUTF(e, q->sub ? q->sub : ""), jg = (*e)->NewStringUTF(e, q->guide ? q->guide : ""), ji = (*e)->NewStringUTF(e, q->initial ? q->initial : "");
+    jstring r = m ? (*e)->CallStaticObjectMethod(e, g_gp, m, g_app->activity->clazz, jt, js, jg, ji, (jint)q->max_chars) : NULL;
+    if ((*e)->ExceptionCheck(e)) { (*e)->ExceptionDescribe(e); (*e)->ExceptionClear(e); r = NULL; }
+    q->ok = r != NULL;
+    if (q->ok) { const char *u = (*e)->GetStringUTFChars(e, r, NULL); snprintf(q->out, (size_t)q->out_cap, "%s", u ? u : ""); (*e)->ReleaseStringUTFChars(e, r, u); }
+    (*vm)->DetachCurrentThread(vm);
+    return NULL;
+}
 int front_text_input(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap) {
     if (!g_gp || out_cap <= 0) return -1;
-    JavaVM *vm = g_app->activity->vm; JNIEnv *e; int attached = 0;
-    if ((*vm)->GetEnv(vm, (void **)&e, JNI_VERSION_1_6) != JNI_OK) { if ((*vm)->AttachCurrentThread(vm, &e, NULL)) return -1; attached = 1; }
-    jmethodID m = (*e)->GetStaticMethodID(e, g_gp, "ask", "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)Ljava/lang/String;");
-    jstring jt = (*e)->NewStringUTF(e, title ? title : ""), js = (*e)->NewStringUTF(e, sub ? sub : ""), jg = (*e)->NewStringUTF(e, guide ? guide : ""), ji = (*e)->NewStringUTF(e, initial ? initial : "");
-    jstring r = m ? (*e)->CallStaticObjectMethod(e, g_gp, m, g_app->activity->clazz, jt, js, jg, ji, (jint)max_chars) : NULL;
-    if ((*e)->ExceptionCheck(e)) { (*e)->ExceptionDescribe(e); (*e)->ExceptionClear(e); r = NULL; }
-    int ok = r != NULL;
-    if (ok) { const char *u = (*e)->GetStringUTFChars(e, r, NULL); snprintf(out, (size_t)out_cap, "%s", u ? u : ""); (*e)->ReleaseStringUTFChars(e, r, u); }
-    LOG("software keyboard: %s", ok ? "confirmed" : "cancelled");
-    if (attached) (*vm)->DetachCurrentThread(vm);
-    return ok;
+    text_req q = {title, sub, guide, initial, max_chars, out_cap, -1, out}; pthread_t th;
+    if (pthread_create(&th, NULL, text_input_thread, &q)) return -1;
+    pthread_join(th, NULL);
+    if (q.ok < 0) return -1;
+    LOG("software keyboard: %s", q.ok ? "confirmed" : "cancelled");
+    return q.ok;
 }
 void front_android_present(const tex_t *t, const int crop[4]) { (void)t; (void)crop; atomic_fetch_add(&g_frames, 1); }
 

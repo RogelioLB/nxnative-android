@@ -50,7 +50,7 @@ game keeps the first one in the app. Game files (code, shaders, RomFS, icon) liv
 
 ## Status
 
-Tested on a **POCO X5 5G** (Snapdragon 695, Adreno 619 GPU, Android 14). Other phones and GPUs have not been tried.
+Tested on a **POCO X5 5G** (Snapdragon 695, Adreno 619 GPU, Android 14); Pokémon Brilliant Diamond also on an **Ayn Odin 2** (Snapdragon 8 Gen 2, Adreno 740 GPU, Android 13). Other phones and GPUs have not been tried.
 
 | Game | State on Android |
 |---|---|
@@ -58,6 +58,7 @@ Tested on a **POCO X5 5G** (Snapdragon 695, Adreno 619 GPU, Android 14). Other p
 | Super Mario 3D World + Bowser's Fury 1.2.2 | Bowser's Fury runs with correct colours; one launch stopped at a black loading screen (open, see the game's note) |
 | Danganronpa V3: Killing Harmony Anniversary Edition 1.0.2 | Runs from a provisional (guessed) profile: its menus, its in-game movies and the start of the story; not played through |
 | The Binding of Isaac: Afterbirth+ 1.7.9b with Repentance | Runs from a provisional profile, with its Repentance DLC; it compiles its shaders at run time, captured on the phone (58 so far, below) |
+| Pokémon Brilliant Diamond 1.3.0 | Playable on the Ayn Odin 2: 60 fps in the overworld, past the introduction and name entry |
 
 Every other game in the [games table](dm/games/README.md#games) has a profile and can be packed the same way, but has not been run on Android. A game without a
 profile can still be packed as an *experimental build* (below): most likely it does not boot, but it is the starting point for porting it.

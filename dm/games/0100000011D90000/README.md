@@ -49,6 +49,7 @@ Build with `scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> --platform
 - The final unsigned 60 fps IPA is 4.6 GB (4,965,541,636 bytes), version 1.3.0, bundle ID `org.nxnative.0100000011d90000`; it contains no code signature. Its 21,392 Metal libraries cover all 14,441 stage shaders and their required variants. The packaged executable contains the new Unity limiter and its exact build gate.
 - [PR #190](https://github.com/seedds/nxnative/pull/190) independently found the shared SDK cut and the same 19 built-in compute shaders on 1.0.0. Its shader tables describe that build; this profile uses the 1.3.0 split. Its AudioOut-stop / FMOD finding is included as a general fix, with a guard preserving buffers queued before Start; the 1.3.0 run passed character selection before that fix.
 - Host tests pass, including synthetic VP8 / VP9 NV12 and RGBA decoding, AudioOut stop / queue stress and integer / float / millisecond / vsync frame-limit regressions. The graphics Python suite passes (41 tests, two skipped); Metal depth / stencil clear, stencil-view, read-only depth and upload-budget regressions pass. Rewriter patch, chain and documentation checks pass.
+- 2026-11-07, Android, an Ayn Odin 2 (Snapdragon 8 Gen 2, Adreno 740, Vulkan 1.3, Android 13) with its built-in controls: a fresh save through language selection, the introduction, both name entries and into the overworld, with no red line. Gameplay holds 60 fps: frame time 16.67 ms median, 17.6 ms at the 95th percentile, about 12 ms of CPU work and 6 ms of GPU time for about 570 draws per frame, 2.3 GB resident. The first launch spent 41 s making 2,996 Vulkan pipelines before the first frame; with the driver's pipeline cache saved, the next launch made 3,136 in 1.1 s.
 
 ## Found on this game
 
@@ -58,6 +59,7 @@ Build with `scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> --platform
 - [Zero initialization of depth and stencil textures](../../../docs/reference/rendering.md#new-textures-start-as-zero).
 - [AudioOut stop releases pending buffers](../../../docs/reference/audio.md#stopping-an-audioout-releases-its-pending-buffers), reported on 1.0.0 in PR #190.
 - [Unity's integer target frame rate](../../../docs/reference/frame-rate.md#unitys-integer-target-frame-rate).
+- [A guest thread attached to the Java VM (Android)](../../../docs/reference/memory.md#a-guest-thread-attached-to-the-java-vm-android): the software keyboard's name entry.
 
 ## Open
 

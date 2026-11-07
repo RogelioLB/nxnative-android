@@ -255,6 +255,13 @@ The guest address space, heaps, pools, virtual address memory and the allocators
 - **Fix:** `dm_android_stack_info` leaves out `pthread_attr_getguardsize` bytes at the bottom, so the range is the usable stack as on Darwin.
 - **Found on:** Danganronpa V3: Killing Harmony Anniversary Edition (010063F014176000, provisional profile, Unity, SDK 10), `main+0x2194c4` on a POCO X5 5G (Adreno 619).
 
+### A guest thread attached to the Java VM (Android)
+
+- **Symptom:** Android only: `CRASH sig=11` in a Unity game's conservative GC mark loop (`prfum pldl1strm` then `ldr x24, [x20, #0x10]`), seconds after the software keyboard closed, at the first page of the range the host reported as the main thread's stack (the page above its guard page). The main thread's own registers point into that range.
+- **Cause:** `front_text_input` (`front_android.c`) attached the guest thread that asked, the main thread, to the Java VM to show the Android text box. Attaching makes ART protect the page above bionic's guard at the bottom of the thread's stack (its implicit stack-overflow check), and the page stays protected after `DetachCurrentThread`. The SDK had recorded the whole range as the main thread's stack at start (`svcQueryMemory`, the entry above), so the GC's next collection read the protected page.
+- **Fix:** the Java call runs on a host thread of its own, which `front_text_input` waits for; no guest thread attaches to the VM.
+- **Found on:** [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md) 1.3.0, `main+0x2944c0`, 17 s after the rival's name entry, on an Ayn Odin 2 (Snapdragon 8 Gen 2, Adreno 740, Android 13).
+
 ### `MapPhysicalMemory` in 16 KB host pages
 
 - **Symptom:** `MapPhysicalMemory` faults on part of a page.
