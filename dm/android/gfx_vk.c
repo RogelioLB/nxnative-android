@@ -568,11 +568,12 @@ static vtex *vt_create(const tex_t *t) {
 // texture uploads' CPU time (deswizzle, BC decode); pipelines made and their creation time: the long-frame lines (hle_nvn.c)
 static _Atomic uint64_t g_up_ns, g_pso_made, g_pso_ns;
 static _Atomic uint64_t g_mod_made, g_mod_ns, g_cpso_made, g_cpso_ns;   // shader modules (variants too) and compute pipelines made, and their creation time (gfx_vk_draw.inc): the driver compiles in both
-static int vt_upload_(vtex *v, const tex_t *t);
-static int vt_upload(vtex *v, const tex_t *t) { uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC); int r = vt_upload_(v, t); atomic_fetch_add(&g_up_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0); return r; }
-static int vt_upload_(vtex *v, const tex_t *t) {
+static int vt_upload_(vtex *v, const tex_t *t, int track);
+// track 0: a one-time fill (tex_init_fill), with no write tracking: the pages are not protected and no dirty span is kept
+static int vt_upload(vtex *v, const tex_t *t, int track) { uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC); int r = vt_upload_(v, t, track); atomic_fetch_add(&g_up_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0); return r; }
+static int vt_upload_(vtex *v, const tex_t *t, int track) {
     g_vs = 2; cpu_view();
-    v->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size);
+    if (track) { v->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size); }
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     if (!bpb) { RED_ONCE(20, "packaged texture format %#x has no block size", t->d.format); return 0; }
     size_t total = 0;
@@ -607,7 +608,48 @@ static int vt_upload_(vtex *v, const tex_t *t) {
     free(tmp); cb_barrier();
     if (vk_debug()) LOG("[vk] upload ser=%llu mem=%p size %#llx levels %u layers %u total %zu first bytes %02x %02x %02x %02x", (unsigned long long)v->serial, t->mem, (unsigned long long)t->L.size, v->levels, v->layers, total, s->p[0], s->p[1], s->p[2], s->p[3]);
     g_up_bytes += total;
-    v->span = nvn_dirty_span(t->mem, t->L.size); v->seen = v->stamp;
+    if (track) { v->span = nvn_dirty_span(t->mem, t->L.size); v->seen = v->stamp; }
+    return 1;
+}
+// A new GPU texture's initial content (nvn_mtl.m tex_init_fill): until the GPU first uses a texture it has not written it, so what its storage holds is its content when the
+// CPU cannot write that pool (CPU_NO_ACCESS: filled from files), cannot cache it (CPU_UNCACHED), or flushed part of it before this first use (nvn_flushed, hle_nvn.c).
+// Breath of the Wild copies its sky scattering tables (System/KSys/sky.skybin, a 256x32x16 RGBA16F 3D texture and two 2D ones) into CPU_CACHED pools with memcpy and
+// flushes them: as images of zeros the sky and the distant haze came out murky olive instead of blue on an Ayn Odin 2, as on the Mac before (seedds/nxnative issue #52)
+int nvn_flushed(const void *p, uint64_t n);   // hle_nvn.c
+static int mem_any(const uint8_t *p, uint64_t n) {   // whether any byte is non-zero (stops at the first)
+    uint64_t i = 0, w;
+    for (; i + 8 <= n; i += 8) { memcpy(&w, p + i, 8); if (w) return 1; }
+    for (; i < n; i++) if (p[i]) return 1;
+    return 0;
+}
+// DM_VK_FILL_CHECK (env.txt, diagnostic): an image read back right after its upload (level 0, every slice), counting what landed; the readback buffer starts as 0xAB
+// so a copy that never ran shows as untouched bytes
+static void fill_check(vtex *v, const tex_t *t, const char *what) {
+    if (!getenv("DM_VK_FILL_CHECK") || v->levels != 1 || v->layers != 1 || v->conv) return;
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh); VkDeviceSize sz = (VkDeviceSize)((v->w + bw - 1) / bw) * ((v->h + bh - 1) / bh) * v->d * bpb; stg_t chk;
+    if (!bpb || !stg_new(&chk, sz)) return;
+    memset(chk.p, 0xAB, (size_t)sz);
+    VkCommandBuffer c = cb();
+    if (c) { VkBufferImageCopy r = {.imageSubresource = {v->aspect, 0, 0, 1}, .imageExtent = {v->w, v->h, v->d}}; vkCmdCopyImageToBuffer(c, v->img, VK_IMAGE_LAYOUT_GENERAL, chk.b, 1, &r);
+        cb_barrier(); submit_wait();
+        uint64_t got = 0, ab = 0; for (VkDeviceSize i = 0; i < sz; i++) { got += chk.p[i] != 0; ab += chk.p[i] == 0xAB; }
+        LOG("[vk] fill check (%s): ser=%llu %ux%ux%u vk%d image %#llx read back at once: %llu of %llu bytes non-zero, %llu still 0xAB", what, (unsigned long long)t->serial, v->w, v->h, v->d, v->fmt,
+            (unsigned long long)(uint64_t)v->img, (unsigned long long)got, (unsigned long long)sz, (unsigned long long)ab); }
+    stg_free(&chk);
+}
+static int tex_init_fill(vtex *v, const tex_t *t) {
+    if (!t->mem || !t->pool || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || t->has_layout || !t->L.size) return 0;
+    if (t->d.samples > 1 || v->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return 0;   // depth and stencil: the GPU's own
+    int no_cpu = (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) != 0, uncached = (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED) != 0;
+    if (no_cpu && (t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE)) return 0;   // in a pool the CPU never writes, a compressible texture's memory may mean nothing to the CPU (nvn_mtl.m)
+    static int flush_fill = -1; if (flush_fill < 0) { const char *e = getenv("DM_NVN_FLUSH_FILL"); flush_fill = !e || atoi(e) != 0; }
+    if (!no_cpu && !uncached && (!flush_fill || !nvn_flushed(t->mem, t->L.size))) return 0;
+    if (!mem_any(t->mem, t->L.size) || !vt_upload(v, t, 0)) return 0;
+    int why = no_cpu ? 0 : uncached ? 1 : 2;
+    static uint64_t n[3]; if (n[why]++ < 4) { uint64_t nz = 0; for (uint64_t i = 0; i < t->L.size; i++) nz += t->mem[i] != 0;
+        LOG("[vk] initial content: ser=%llu %ux%ux%u format %#x filled from its storage (%llu of %llu bytes non-zero), %s (%llu so far)", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format,
+            (unsigned long long)nz, (unsigned long long)t->L.size, (const char *[]){"a CPU_NO_ACCESS pool's", "a CPU_UNCACHED pool's", "flushed by the CPU before its first use"}[why], (unsigned long long)n[why]); }
+    fill_check(v, t, "fill");
     return 1;
 }
 // Writes beside a texture (nvn_mtl.m pkg_edge_ranges / pkg_edges_take / pkg_edges_clean): the texture's bytes in the host pages it shares with other data
@@ -674,7 +716,7 @@ static vtex *vt_get(const tex_t *ct) {
         int clean = v->span && (now == v->seen || !nvn_dirty_since_span(v->span, t->mem, t->L.size, v->stamp));
         v->seen = now;
         if (clean || edges_clean(v, t)) return v;
-        if (vt_upload(v, t)) { g_pkg_reuploads++; edges_take(v, t); }
+        if (vt_upload(v, t, 1)) { g_pkg_reuploads++; edges_take(v, t); }
         return v;
     }
     if (v && !pkg) { v->used = atomic_load(&g_fence); return v; }
@@ -686,8 +728,8 @@ static vtex *vt_get(const tex_t *ct) {
     }
     if (!(v = vt_create(t))) return NULL;
     v->used = atomic_load(&g_fence);
-    if (pkg) { v->pkg = 1; if (vt_upload(v, t)) { g_pkg_uploads++; edges_take(v, t); } }
-    else if (t->pool) { share_take_over(&k); nvn_hm_put(&g_share, &k, v); v->shared = 1; }
+    if (pkg) { v->pkg = 1; if (vt_upload(v, t, 1)) { g_pkg_uploads++; edges_take(v, t); } }
+    else if (t->pool) { tex_init_fill(v, t); share_take_over(&k); nvn_hm_put(&g_share, &k, v); v->shared = 1; }
     vt_ref(t->serial, v);
     return v;
 }

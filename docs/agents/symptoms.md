@@ -443,6 +443,7 @@ One line per symptom in the [subsystem references](../reference/): what you see 
 - Android only: a black picture while the game runs at full rate with no draw dropped; every render target of a pass dump is all zero, and the dump's binding lines show `tid 0 sid 0 -> none` for every texture. → [Texture and sampler banks packed in one `cbuf_slot`](../reference/rendering.md#texture-and-sampler-banks-packed-in-one-cbuf_slot)
 - Android only: the 3D scene turns blue (red and green almost gone) after the tone-mapping pass, while the G-buffer and the HDR lighting in a pass dump look right; the pass reads a small 3D texture (an 8×8×8 R11G11B10F colour-grading LUT). → [A 3D render target drawn one slice at a time](../reference/rendering.md#a-3d-render-target-drawn-one-slice-at-a-time)
 - Android only: a movie plays black (its sound runs) and the game's picture is fine before and after it; in a pass dump the decoded luma and chroma planes hold the picture, but the YUV-to-RGB pass that reads them writes all zero. → [A shader's own constants (c1) read after the control section is gone](../reference/rendering.md#a-shaders-own-constants-c1-read-after-the-control-section-is-gone)
+- Android only: a texture the game fills on the CPU reads as zeros on the GPU; Breath of the Wild's sky brownish or murky olive and its distant haze dark instead of blue. → [A texture's first content from storage the CPU flushed](../reference/rendering.md#a-textures-first-content-from-storage-the-cpu-flushed)
 
 ## Shaders
 
