@@ -747,7 +747,28 @@ static void prof_write(void) {
                  r->ncolor, r->f0, r->depth, r->draws, (unsigned long long)r->verts, (unsigned long long)r->big, r->bigvs ? r->bigvs : "-", r->bigfs ? r->bigfs : "-"); }
     g_nprof = 0; g_prof_at = -1;
 }
-static void rp_end(void) { if (P.active) { occl_end(); prof_pass_end(); vkCmdEndRenderPass(C->cb); P.active = 0; if (dump_on()) dump_pass_end(); } }
+// A linear render target (LINEAR / LINEAR_RENDER_TARGET in a pool the CPU can read) is how a game hands GPU results to the CPU: it draws into the texture and reads the
+// pool's memory after a fence. nvn_mtl.m makes such a texture a view on the pool's memory, so the GPU writes land there; here the image is the texture, so the level drawn
+// is copied back into guest memory (rows at the texture's stride, as vt_upload reads them) when the chunk completes, before its fence is signalled (chunk_done).
+// Breath of the Wild draws about twenty (1×1 to 512×512, CPU_CACHED | GPU_CACHED pools) and reads ground heights from them: read as zeros, every grass press got the presser's
+// world height instead of its height above the ground (about 250 instead of below 1 at Link's feet), pressed nothing, and the grass stood through Link's legs
+static void lin_writeback(vtex *v, uint32_t lv, uint32_t ly) {
+    if (!v->pkg || !v->store || v->conv || lv || v->type == VK_IMAGE_TYPE_3D || v->aspect != VK_IMAGE_ASPECT_COLOR_BIT || !(v->desc.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) return;
+    if (v->pool && (((const pool_t *)v->pool)->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) return;   // the CPU cannot read it: nothing to hand over
+    int bw, bh, bpb = nvn_fmt_bpb(v->desc.format, &bw, &bh); if (!bpb) return;
+    nvn_texlayout L; nvn_tex_layout(&v->desc, &L);
+    size_t pitch = (size_t)((v->w + bw - 1) / bw) * bpb, rows = (v->h + bh - 1) / bh, srow = L.layer_size / (rows ? rows : 1); if (srow < pitch) srow = pitch;
+    stg_t *s = stg_take(pitch * rows); if (!s) return; int si = (int)(s - C->stg);
+    VkBufferImageCopy r = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, ly, 1}, .imageExtent = {v->w, v->h, 1}};
+    cb_barrier(); vkCmdCopyImageToBuffer(C->cb, v->img, VK_IMAGE_LAYOUT_GENERAL, s->b, 1, &r); cb_barrier();
+    wb_t *w = wb_add(); if (w) *w = (wb_t){si, 0, pitch, rows, pitch, srow, (uint8_t *)v->store + (size_t)ly * L.layer_size, NULL, 0};
+    static int nlog; if (nlog++ < 4) LOG("[vk] linear render target s%llu %ux%u (format %#x) written back to guest memory after its pass", (unsigned long long)v->serial, v->w, v->h, v->desc.format);
+}
+static void rp_end(void) {
+    if (!P.active) return;
+    occl_end(); prof_pass_end(); vkCmdEndRenderPass(C->cb); P.active = 0; if (dump_on()) dump_pass_end();
+    for (int i = 0; i < 8; i++) if (P.cv[i]) lin_writeback(P.cv[i], P.clv[i], P.cly[i]);
+}
 // the render pass of the bound render targets (R.rt): images, views and framebuffer, made before the draw's textures are resolved (that may record uploads, outside a pass)
 static int rp_prepare(void) {
     if (P.active) return 1;

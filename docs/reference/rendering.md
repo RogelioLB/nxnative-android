@@ -937,6 +937,13 @@ The NVN replay on Vulkan for Android phones (`dm/android/gfx_vk.c`, `gfx_vk_draw
 - **Fix:** the range is taken from the indices as they are written; storage buffer snapshots are copied from guest memory, not from the arena.
 - **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md): 78 → 27 ms of replay CPU a frame in a level.
 
+### Linear render targets written back to guest memory
+
+- **Symptom:** Android only: what a game reads on the CPU from textures it draws into is zeros or stale. Breath of the Wild: Link sinks into grass up to his knees while he stands still, and the grass presses in a pass dump carry the presser's world height (`c3[3].z` about 200–270 instead of below 1) with a flat slope.
+- **Cause:** a linear texture (`LINEAR` / `LINEAR_RENDER_TARGET`) in a pool the CPU can read is how a game hands GPU results to the CPU: it draws into the texture and reads the pool's memory after a fence. On Metal such a texture is a view on the pool's memory, so the GPU's writes land there; the Vulkan replay uploads linear textures from guest memory but never wrote what a pass drew into one back.
+- **Fix:** `rp_end` (`gfx_vk_draw.inc`) copies each linear colour target the pass drew (level 0, its layer) into a staging buffer, and the chunk's write-backs put it into guest memory at the texture's stride when the chunk completes, before its fence is signalled (`lin_writeback`). The written pages count as dirty, so a later use of the texture uploads the same bytes again.
+- **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md), on an Ayn Odin 2: about twenty linear targets (1×1 to 512×512, CPU_CACHED | GPU_CACHED pools), from which the game reads ground heights for its grass presses (`3c79f4112a877d13` / `9786d84e2006896d`). With the heights read as zero every press had zero strength and the player's own press (`a08dbfa4a0f98f44`) was not drawn at all. A Mac run from the same save (`DM_NVN_PASSDUMP` with `DM_NVN_CBDUMP`) gave the reference values; after the fix the Odin's match them (`c3[3]` (0.376, 0.028, −0.268) against (0.377, 0.028, −0.268)).
+
 ### Pipeline keys built from the state objects' fields
 
 - **Symptom:** new graphics pipelines made all through play, also in a level seen before (a few per frame, about 1 to 2 ms each on the Adreno); the start-up list of pipelines grew past 186,000 keys over a few sessions, and making it again took the fast cores for most of an hour.
