@@ -649,7 +649,7 @@ static int dump_bytes(VkFormat f) {   // the texel size of what the dump copies:
 }
 static uint64_t g_dump_tex[32]; static int g_ndump_tex;   // the textures this pass's draws read (dump_note_tex), copied at its end with the targets
 static void dump_note_tex(uint64_t ser) { for (int i = 0; i < g_ndump_tex; i++) if (g_dump_tex[i] == ser) return; if (g_ndump_tex < 32) g_dump_tex[g_ndump_tex++] = ser; }
-static dump_t g_dumps[512]; static int g_ndump, g_dump_pass;
+static dump_t g_dumps[1024]; static int g_ndump, g_dump_pass;
 // or a file named dump_now in $DM_DUMP_DIR's parent: the frame two presents after it is seen (checked every 30 presents; the file is removed)
 static long g_dump_at = -2;
 static long dump_frame(void) { if (g_dump_at == -2) { const char *e = getenv("DM_VK_DUMP"); g_dump_at = e ? atol(e) : -1; } return g_dump_at; }
@@ -675,13 +675,15 @@ static void dump_pass_end(void) {
         vkCmdPipelineBarrier(C->cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     }
     for (int i = 0; i < g_ndump_tex; i++) {   // level 0, layer 0 of each texture the draws read (colour, uncompressed): f<frame>_p<pass>_t_<w>x<h>_vk<format>_s<serial>
+        // a 3D texture: every depth slice, stacked downwards (the height in the name is the slices' total)
         vtex *v = nvn_hm_get(&g_tex, &g_dump_tex[i]); int bpp = v ? dump_bytes(v->fmt) : 0;
         if (!bpp || v->aspect != VK_IMAGE_ASPECT_COLOR_BIT || v->samples > 1 || g_ndump >= (int)(sizeof g_dumps / sizeof *g_dumps)) continue;
-        dump_t *d = &g_dumps[g_ndump]; if (!stg_new(&d->s, (VkDeviceSize)v->w * v->h * bpp)) continue;
-        d->w = v->w; d->h = v->h; d->f = v->fmt; d->pass = g_dump_pass; d->att = -1; d->ser = v->serial; g_ndump++;
+        uint32_t z = v->type == VK_IMAGE_TYPE_3D ? v->d : 1;
+        dump_t *d = &g_dumps[g_ndump]; if (!stg_new(&d->s, (VkDeviceSize)v->w * v->h * z * bpp)) continue;
+        d->w = v->w; d->h = v->h * z; d->f = v->fmt; d->pass = g_dump_pass; d->att = -1; d->ser = v->serial; g_ndump++;
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
         vkCmdPipelineBarrier(C->cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-        VkBufferImageCopy r = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {v->w, v->h, 1}};
+        VkBufferImageCopy r = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {v->w, v->h, z}};
         vkCmdCopyImageToBuffer(C->cb, v->img, VK_IMAGE_LAYOUT_GENERAL, d->s.b, 1, &r);
     }
     g_ndump_tex = 0;
@@ -1327,6 +1329,11 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
                 if (!mtl_addr(u->addr, rd, NULL, NULL)) { RED_ONCE(119, "uniform buffer slot %d of shader %s at %#llx is in no memory pool: it reads 0", slot - 3, s->key, (unsigned long long)u->addr); src = NULL; n = 16; } }
             else { static int nlog; if (nlog++ < 8) LOG("[RED] [vk] shader %s reads uniform slot %d, which has no buffer bound: it reads 0", s->key, slot - 3); } }
         if (s->cb[i].ext && n > s->cb[i].ext) n = s->cb[i].ext;   // only what the shader reads (spv_cb_ext)
+        if (dump_on() && slot != 0 && slot != 2) {   // the draw's constant buffers in the dump's log: c1 (the shader's own segment) and the game's uniform buffers, the first 8 vec4
+            char vb[700]; int q = 0; const float *fv = src; size_t nf = src ? n / 4 : 0; if (nf > 32) nf = 32;
+            for (size_t j = 0; j < nf && q < (int)sizeof vb - 20; j++) q += snprintf(vb + q, sizeof vb - q, "%s%g", j % 4 ? " " : j ? ") (" : "(", fv[j]);
+            LOG("[dump]   %s c%d: %s %zu bytes %s%s", s->key, slot, src ? "read" : "no source,", n, vb, nf ? ")" : "");
+        }
         size_t al = (n + 15) & ~(size_t)15; if (!ucopy(src, n, al, &b, &off)) return 0;
         bi[nbi] = (VkDescriptorBufferInfo){b, off, al}; wr[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)s->cb[i].binding, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, NULL, &bi[nbi++], NULL};
     }
@@ -1396,8 +1403,8 @@ static int stage_set(vshader *s, VkDescriptorSet set, const prog_t *pr, int prog
             if (!iv) { g_bind_bad = 1; RED_ONCE(113, "no stand-in for an unbound multisample slot on this GPU: skipped"); iv = dummy_view(vt); }
             const samp_par *sp = sid > 0 && sid < g_nsreg && g_sreg_ok[sid] ? &g_sreg[sid] : NULL;
             if (dump_on() && e < 4) { const vtex *dv = tid > 0 && tid < g_ntreg && g_treg[tid].ok ? nvn_hm_get(&g_tex, &g_treg[tid].t.serial) : NULL; if (dv) dump_note_tex(dv->serial);
-                LOG("[dump]   %s binding %d[%d] type %#x tid %d sid %d -> %s s%llu %ux%ux%u layers %u levels %u vk%d pkg %d", s->key, t->binding, e, t->type, tid, sid, dv ? "tex" : "none",
-                    dv ? (unsigned long long)dv->serial : 0ull, dv ? dv->w : 0, dv ? dv->h : 0, dv ? dv->d : 0, dv ? dv->layers : 0, dv ? dv->levels : 0, dv ? dv->fmt : 0, dv ? dv->pkg : 0); }
+                LOG("[dump]   %s binding %d[%d] type %#x tid %d sid %d -> %s s%llu %ux%ux%u layers %u levels %u vk%d pkg %d image %#llx", s->key, t->binding, e, t->type, tid, sid, dv ? "tex" : "none",
+                    dv ? (unsigned long long)dv->serial : 0ull, dv ? dv->w : 0, dv ? dv->h : 0, dv ? dv->d : 0, dv ? dv->layers : 0, dv ? dv->levels : 0, dv ? dv->fmt : 0, dv ? dv->pkg : 0, dv ? (unsigned long long)(uint64_t)dv->img : 0ull); }
             ii[nii + e] = (VkDescriptorImageInfo){samp_get(sp, (t->type & 0x400) != 0), iv, VK_IMAGE_LAYOUT_GENERAL};
         }
         wr[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)t->binding, 0, (uint32_t)cnt, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &ii[nii], NULL, NULL};
@@ -1764,8 +1771,10 @@ static int vk_draw_(const p_draw *dw, const p_draw_idx *di) {
         if (nv > pr->big) { pr->big = nv; pr->bigvs = k.sh[0]->key; pr->bigfs = k.sh[1] ? k.sh[1]->key : NULL; } }
     if (dump_on()) {
         char tg[160] = ""; for (int i = 0; i < 8; i++) if (P.cv[i]) { size_t l = strlen(tg); snprintf(tg + l, sizeof tg - l, " a%d=s%llu(%ux%u vk%d)", i, (unsigned long long)P.cv[i]->serial, P.cv[i]->w, P.cv[i]->h, P.cv[i]->fmt); }
-        LOG("[dump] pass %d draw %llu: vs %s fs %s prim %d count %u inst %u%s vp %.0f,%.0f %.0fx%.0f sc %d,%d %ux%u ll %d targets%s", g_dump_pass + 1, (unsigned long long)g_draws,
-            k.sh[0]->key, k.sh[1] ? k.sh[1]->key : "-", prim, count, inst, di ? " indexed" : "", v.x, v.y, v.width, v.height, sc.offset.x, sc.offset.y, sc.extent.width, sc.extent.height, g_origin_ll, tg);
+        LOG("[dump] pass %d draw %llu: vs %s fs %s prim %d count %u inst %u%s vp %.0f,%.0f %.0fx%.0f sc %d,%d %ux%u ll %d targets%s; blend %#x [%u %u %u / %u %u %u] mask %#x cull %u front %u", g_dump_pass + 1, (unsigned long long)g_draws,
+            k.sh[0]->key, k.sh[1] ? k.sh[1]->key : "-", prim, count, inst, di ? " indexed" : "", v.x, v.y, v.width, v.height, sc.offset.x, sc.offset.y, sc.extent.width, sc.extent.height, g_origin_ll, tg,
+            k.color.blend_en, (unsigned)k.blend[0].src_rgb, (unsigned)k.blend[0].dst_rgb, (unsigned)k.blend[0].eq_rgb, (unsigned)k.blend[0].src_a, (unsigned)k.blend[0].dst_a, (unsigned)k.blend[0].eq_a,
+            k.chmask.mask, (unsigned)k.poly.cull, (unsigned)k.poly.front);
     }
     if (D.tf_on && k.sh[0]->modtf) { g_drawing = 0; return tf_capture(k.sh[0], pprog[0], pst[0], dw, di); }   // drawn and captured (nvn_mtl.m draw)
     return 1;

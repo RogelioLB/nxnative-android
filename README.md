@@ -122,7 +122,7 @@ When a game shows a black or wrong picture, these files in `Android/data/org.nxn
 30 frames and removed when taken; `adb shell touch <path>` creates one):
 
 - `shot_now`: the next presented frame as a PNG in `dump/` (`DM_NVN_SHOT=<frame>[,<frame>...]:<path>` in `env.txt` does the same for given frames).
-- `dump_now`: every render target of one frame, after each pass, as `.raw` and `.png` in `dump/`, with each draw's shaders and bound textures in the log.
+- `dump_now`: every render target of one frame, after each pass, as `.raw` and `.png` in `dump/` (a 3D texture's slices stacked, up to 1,024 images), with each draw's shaders, bound textures, constant buffers (their first values) and blend state in the log.
 - `threads_now`: every game thread's state, what it waits on and its backtrace, in the log (for a game that stops moving on).
 
 ## Games that compile their shaders while they run

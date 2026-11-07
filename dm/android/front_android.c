@@ -183,7 +183,9 @@ static void start_host(void) {
     snprintf(buf, sizeof buf, "%s/cache/%s/pipeline.cache", g_int, DM_GAME_ID); setenv("DM_PIPELINE_CACHE", buf, 0);   // gfx_vk_draw.inc
     setenv("DM_AUDIO", "1", 0);
     setenv("DM_OPMODE", "0", 0);   // a phone is a handheld: games draw at the panel's 720p, not the TV's 1080p (the Adreno 619 cannot keep docked passes at 60 fps); env.txt DM_OPMODE=1 overrides
-    snprintf(buf, sizeof buf, "%s/dump", g_ext); setenv("DM_DUMP_DIR", buf, 0); if (getenv("DM_VK_DUMP")) mkdirs(buf);   // gfx_vk_draw.inc dump_write (files/dump_now asks for one)
+    // gfx_vk_draw.inc dump_write; made at every start: the request files beside it (shot_now, dump_now, threads_now, vk_mid) are looked up as <DM_DUMP_DIR>/../<name>,
+    // which does not resolve while the folder is missing, so on a fresh install none of them was ever seen
+    snprintf(buf, sizeof buf, "%s/dump", g_ext); setenv("DM_DUMP_DIR", buf, 0); mkdirs(buf);
     snprintf(buf, sizeof buf, "%s/main.fixups.tsv", code);
     if (exists(buf) && !getenv("DM_FORCE_SELFTEST")) {
         setenv("DM_ROOT", g_game, 0);
