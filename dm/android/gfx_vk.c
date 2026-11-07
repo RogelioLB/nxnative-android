@@ -372,25 +372,53 @@ static void *chunk_thread(void *arg) {
 }
 
 // ---------------- Memory pools (GPU address = CPU address) ----------------
+// Kept sorted by start, found by binary search, and remembered per thread (the last PC_RECENT pools found, valid while g_pool_gen is unchanged: every add and removal bumps it),
+// as nvn_mtl.m's pool index does. Every uniform and storage buffer of every draw asks here whether it lies in a pool; a scan of every pool under the lock took 20% of Breath of
+// the Wild's render thread on an Ayn Odin 2 (mtl_addr inlined into stage_set, about 3,300 draws a frame)
 typedef struct { const uint8_t *lo, *hi; } pool_rng;
 static pool_rng *g_pools; static int g_npool, g_cappool; static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t g_pool_gen = 1;
+enum { PC_RECENT = 8 };
+static __thread struct { uint64_t gen; unsigned next; pool_rng r[PC_RECENT]; } t_pc;   // an empty entry has hi NULL
 void mtl_pool_add(const void *mem, uint64_t size) {
     pthread_mutex_lock(&g_pool_mu);
     if (g_npool == g_cappool) { g_cappool = g_cappool ? 2 * g_cappool : 64; g_pools = realloc(g_pools, g_cappool * sizeof *g_pools); }
-    g_pools[g_npool++] = (pool_rng){mem, (const uint8_t *)mem + size};
+    int at = g_npool; while (at > 0 && g_pools[at - 1].lo > (const uint8_t *)mem) at--;   // pools come and go rarely: a move keeps the order
+    memmove(g_pools + at + 1, g_pools + at, (size_t)(g_npool - at) * sizeof *g_pools); g_npool++;
+    g_pools[at] = (pool_rng){mem, (const uint8_t *)mem + size};
+    atomic_fetch_add_explicit(&g_pool_gen, 1, memory_order_release);
     pthread_mutex_unlock(&g_pool_mu);
 }
 void mtl_pool_del(const void *mem) {
     pthread_mutex_lock(&g_pool_mu);
-    for (int i = 0; i < g_npool; i++) if (g_pools[i].lo == mem) { g_pools[i] = g_pools[--g_npool]; break; }
+    for (int i = 0; i < g_npool; i++) if (g_pools[i].lo == mem) { memmove(g_pools + i, g_pools + i + 1, (size_t)(--g_npool - i) * sizeof *g_pools); break; }
+    atomic_fetch_add_explicit(&g_pool_gen, 1, memory_order_release);
     pthread_mutex_unlock(&g_pool_mu);
 }
+static int pool_find(const uint8_t *a, uint64_t len) {   // under g_pool_mu: the pool holding [a, a + len), or -1
+    int lo = 0, hi = g_npool - 1, hit = -1;   // the last pool whose start ≤ a
+    while (lo <= hi) { int m = (lo + hi) / 2; if (g_pools[m].lo <= a) { hit = m; lo = m + 1; } else hi = m - 1; }
+    if (hit >= 0 && a + len <= g_pools[hit].hi) return hit;
+    for (int i = 0; i < g_npool; i++) if (a >= g_pools[i].lo && a + len <= g_pools[i].hi) return i;   // pools that overlap: the first that holds it, as before
+    return -1;
+}
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
-    int ok = 0; pthread_mutex_lock(&g_pool_mu);
-    for (int i = 0; i < g_npool; i++) if ((const uint8_t *)addr >= g_pools[i].lo && (const uint8_t *)addr + len <= g_pools[i].hi) {
-        if (buf) *buf = (void *)g_pools[i].lo; if (off) *off = addr - (uint64_t)g_pools[i].lo; ok = 1; break; }
-    pthread_mutex_unlock(&g_pool_mu);
-    return ok;
+    const uint8_t *a = (const uint8_t *)(uintptr_t)addr; pool_rng p = {NULL, NULL};
+    if (t_pc.gen == atomic_load_explicit(&g_pool_gen, memory_order_acquire))
+        for (unsigned k = 0; k < PC_RECENT; k++) if (a >= t_pc.r[k].lo && a + len <= t_pc.r[k].hi) { p = t_pc.r[k]; break; }
+    if (!p.hi) {
+        pthread_mutex_lock(&g_pool_mu);
+        int i = pool_find(a, len);
+        if (i >= 0) {
+            p = g_pools[i]; uint64_t gen = atomic_load_explicit(&g_pool_gen, memory_order_relaxed);
+            if (t_pc.gen != gen) { memset(t_pc.r, 0, sizeof t_pc.r); t_pc.gen = gen; }
+            t_pc.r[t_pc.next++ % PC_RECENT] = p;
+        }
+        pthread_mutex_unlock(&g_pool_mu);
+        if (!p.hi) return 0;
+    }
+    if (buf) *buf = (void *)p.lo; if (off) *off = addr - (uint64_t)(uintptr_t)p.lo;
+    return 1;
 }
 void vt_drop_pool(const void *pool);   // below, with the textures
 void mtl_alias_drop_pool(const void *pool) { vt_drop_pool(pool); }
